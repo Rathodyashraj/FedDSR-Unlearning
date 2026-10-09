@@ -34,6 +34,7 @@ MASK_KEYS = (
     "quantizer_bottom.active_mask",
 )
 DECODER_PREFIX = "decoder."
+ENCODER_MODULES = tuple(p.rstrip(".") for p in ENCODER_PREFIXES)  # attribute names on VQVAE2
 
 # Level name -> (quantizer attribute, decoder entry conv attribute)
 LEVELS = {
@@ -290,6 +291,16 @@ def masked_nearest(dist, mask):
     if not bool(mask.all()):
         dist = dist.masked_fill(~mask.to(dist.device), float("inf"))
     return torch.argmin(dist, dim=1)
+
+
+def nearest_rows(z_flat, codebook, mask=None):
+    """Nearest (active) row for flat latents [P, D], computed in blocks of positions to bound memory."""
+    chunk = settings.DISTANCE_CHUNK_POSITIONS
+    out = []
+    for start in range(0, z_flat.shape[0], chunk):
+        dist = squared_distances(z_flat[start:start + chunk], codebook)
+        out.append(torch.argmin(dist, dim=1) if mask is None else masked_nearest(dist, mask))
+    return torch.cat(out)
 
 
 # -----------------

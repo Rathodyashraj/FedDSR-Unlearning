@@ -10,6 +10,7 @@ import contextlib
 import copy
 import glob
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -878,6 +879,407 @@ def check_step2_toy(args):
     return ("weights " + ", ".join("%.6f" % got["weights"][k] for k in raw)
             + f"; masks top {got['mask_top'].tolist()}, bottom {got['mask_bot'].tolist()}; "
             f"V and delta match to 1e-12; all-negative similarities -> equal w_sim")
+
+
+# -----------------
+# Phase 6 (Step 3)
+# -----------------
+def step3_inputs(args):
+    from unlearning import step3_shrink_repair as s3
+    require_results_dir()
+    helpers.set_withdrawn(args.withdraw)
+    try:
+        return s3.load_inputs(args.withdraw, settings.DEVICE)
+    except FileNotFoundError as e:
+        raise CheckFailed(f"{e} (run the Phase 3 and Phase 5 checks first)")
+
+
+def old_codebook_targets(ref, quantities):
+    """Quantities whose clean codebook is the old codebook itself, all rows active."""
+    q = dict(quantities)
+    for level, sfx in (("top", "top"), ("bottom", "bot")):
+        q[f"V_{sfx}"] = helpers.quantizer(ref, level)._embedding.weight.detach().clone()
+        q[f"mask_{sfx}"] = torch.ones_like(quantities[f"mask_{sfx}"])
+    return q
+
+
+def count_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path) as f:
+        return sum(1 for _ in f)
+
+
+@contextlib.contextmanager
+def settings_override(**values):
+    old = {k: getattr(settings, k) for k in values}
+    try:
+        for k, v in values.items():
+            setattr(settings, k, v)
+        yield
+    finally:
+        for k, v in old.items():
+            setattr(settings, k, v)
+
+
+@check(6, "Step 3: hinge on the toy example of Appendix A")
+def check_step3_hinge_toy(args):
+    from unlearning import step3_shrink_repair as s3
+    V = torch.tensor([[2., 2.], [5., 5.], [1., 5.]])
+    z = torch.tensor([[3.6, 3.6], [2.1, 2.2]])
+    dist = helpers.squared_distances(z, V)
+    h = s3.hinge(dist, torch.tensor([0, 0]), delta=1.0)
+    require(abs(float(dist[0, 0]) - 5.12) < 1e-5 and abs(float(dist[0, 1]) - 3.92) < 1e-5, f"distances {dist[0].tolist()}")
+    require(abs(float(h[0]) - 2.2) < 1e-5, f"hinge of (3.6, 3.6) is {float(h[0])}, expected 2.2")
+    require(float(h[1]) == 0.0, f"hinge of (2.1, 2.2) is {float(h[1])}, expected 0")
+    # an inactive row is ignored even when it is the closest
+    mask = torch.tensor([True, False, True])
+    hm = s3.hinge(dist.masked_fill(~mask, float("inf")), torch.tensor([0, 0]), delta=1.0)
+    require(abs(float(hm[0]) - max(0.0, 5.12 - float(dist[0, 2]) + 1.0)) < 1e-5, "masked row was not ignored")
+    return (f"(3.6, 3.6): d_t=5.12, nearest other 3.92 -> h={float(h[0]):.4f}; (2.1, 2.2): h={float(h[1]):.1f}; "
+            f"with row 1 inactive: h={float(hm[0]):.4f}")
+
+
+@check(6, "Step 3: aggregation of identical client encoders returns the same encoder")
+def check_step3_aggregate_identity(args):
+    from unlearning import step3_shrink_repair as s3
+    ref, phi0, q, weights = step3_inputs(args)
+    enc = {k: v for k, v in ref.state_dict().items() if helpers.is_encoder_key(k)}
+    w = [weights[k] for k in sorted(weights)]
+    out = s3.aggregate([enc, enc, enc], w)
+    diff = [k for k in enc if not torch.equal(out[k], enc[k])]
+    require(not diff, f"{len(diff)} tensors changed, e.g. {diff[:2]}")
+    return f"{len(enc)} tensors bit-identical with weights {[round(x, 4) for x in w]}"
+
+
+@check(6, "Step 3: shrink and repair alone on one client, one shrink")
+def check_step3_single(args):
+    import tempfile as tf
+    from unlearning import step3_shrink_repair as s3
+    ref, phi0, q, weights = step3_inputs(args)
+    k = helpers.remaining_clients(args.withdraw)[0]
+    with tf.TemporaryDirectory() as tmp:
+        records = helpers.JsonlWriter(os.path.join(tmp, "repairs.jsonl"))
+        wk = s3.ClientWorker(k, ref, phi0, q, records)
+        wk.start_round(1, 1)
+        before = wk.encoder_state()
+        s3.shrink(wk.encoder, phi0)
+        after_shrink = wk.encoder_state()
+        for name in before:
+            expected = phi0[name] + settings.SHRINK_FACTOR * (before[name] - phi0[name])
+            require(torch.allclose(after_shrink[name], expected, rtol=0, atol=1e-7), f"shrink wrong for {name}")
+        rec = wk.repair(shrink_number=1)
+        with open(os.path.join(tmp, "repairs.jsonl")) as f:
+            saved = json.loads(f.readline())
+    require(saved == json.loads(json.dumps(rec)), "repair record not written")
+    require(rec["batches"] <= rec["cap"] and rec["done"] != rec["stalled"], "inconsistent repair record")
+    require(all(set(c) == {"batches", "flip_top", "flip_bottom"} for c in rec["checks"]), "bad check entries")
+    changed = any(not torch.equal(after_shrink[n], v) for n, v in wk.encoder_state().items())
+    require(changed, "repair did not update the encoder")
+    last = rec["checks"][-1]
+    return (f"client {k}: shrink exact; repair used {rec['batches']}/{rec['cap']} batches, "
+            f"flip rate at checks " + ", ".join("%.1f%%/%.1f%%" % (100 * c["flip_top"], 100 * c["flip_bottom"]) for c in rec["checks"])
+            + f" (top/bottom) -> {'done' if rec['done'] else 'stalled'}")
+
+
+@check(6, "Step 3: during a repair, codebooks, masks, reference model and decoders are unchanged")
+def check_step3_repair_side_effects(args):
+    import tempfile as tf
+    from unlearning import step3_shrink_repair as s3
+    ref, phi0, q, weights = step3_inputs(args)
+    k = helpers.remaining_clients(args.withdraw)[0]
+    ref_before = {n: v.clone() for n, v in ref.state_dict().items()}
+    q_before = {n: (v.clone() if torch.is_tensor(v) else v) for n, v in q.items()}
+    phi0_before = {n: v.clone() for n, v in phi0.items()}
+    helpers._ACCESS_LOG.clear()
+    with tf.TemporaryDirectory() as tmp:
+        wk = s3.ClientWorker(k, ref, phi0, q, helpers.JsonlWriter(os.path.join(tmp, "r.jsonl")))
+        wk.start_round(1, 1)
+        start = wk.encoder_state()
+        wk.repair(shrink_number=0)
+    require(same_tensors(ref_before, ref.state_dict()), "reference model changed")
+    for n, v in q_before.items():
+        require(torch.equal(v, q[n]) if torch.is_tensor(v) else v == q[n], f"{n} changed")
+    require(same_tensors(phi0_before, phi0), "phi0 changed")
+    require(not any(n.startswith(helpers.DECODER_PREFIX) for n, _ in wk.encoder.named_parameters()), "decoder in the working model")
+    kinds = {kind for kind, _, _ in helpers.access_log()}
+    require(not any("decoder" in kd for kd in kinds), f"a decoder was opened: {kinds}")
+    require(any(not torch.equal(start[n], v) for n, v in wk.encoder_state().items()), "the working encoder did not change")
+    return ("reference model, clean codebooks, masks, margins and phi0 bit-identical after a repair; "
+            "no decoder built or opened; only the working encoder changed")
+
+
+@check(6, "Step 3: repair with no shrink, old encoder and old codebook as target")
+def check_step3_repair_zero_flips(args):
+    import tempfile as tf
+    from unlearning import step3_shrink_repair as s3
+    ref, phi0, q, weights = step3_inputs(args)
+    q_old = old_codebook_targets(ref, q)
+    q_old["delta_top"] = q_old["delta_bot"] = 0.0
+    lines = []
+    with tf.TemporaryDirectory() as tmp:
+        for k in helpers.remaining_clients(args.withdraw):
+            wk = s3.ClientWorker(k, ref, phi0, q_old, helpers.JsonlWriter(os.path.join(tmp, "r.jsonl")))
+            wk.start_round(1, 1)
+            start = wk.encoder_state()
+            rec = wk.repair(shrink_number=0)
+            first = rec["checks"][0]
+            require(first["flip_top"] == 0 and first["flip_bottom"] == 0, f"client {k}: flips {first}")
+            require(rec["done"] and len(rec["checks"]) == 1, f"client {k}: not done at the first check")
+            require(same_tensors(start, wk.encoder_state()), f"client {k}: encoder moved although nothing flipped")
+            lines.append(f"client {k}: 0 flips, done after {rec['batches']} batches")
+    return "margin 0: " + "; ".join(lines) + "; encoder unchanged (zero hinge, zero gradient)"
+
+
+@check(6, "Step 3: thirty shrinks with repairs switched off")
+def check_step3_thirty_shrinks(args):
+    import tempfile as tf
+    from unlearning import step3_shrink_repair as s3
+    ref, phi0, q, weights = step3_inputs(args)
+    old = {n: v.detach().clone() for n, v in ref.named_parameters() if helpers.is_encoder_key(n)}
+    with tf.TemporaryDirectory() as tmp:
+        summary = s3.run_step3(args.withdraw, out_dir=tmp, repair_enabled=False, shrink_rounds=6, shrinks_per_round=5)
+        got = helpers.load_file(os.path.join(tmp, "encoder_unlearned.pth"))
+        rounds_saved = sorted(d for d in os.listdir(tmp) if d.startswith("round_"))
+    factor = settings.SHRINK_FACTOR ** 30
+    # "To float precision": at most one float32 rounding of the weight size per operation
+    # (30 shrinks + 6 aggregations), measured against the exact value in float64.
+    eps, ops = torch.finfo(torch.float32).eps, 36
+    worst = 0.0
+    w_list = [weights[k] for k in sorted(weights)]
+    for n in old:
+        p0, o = phi0[n].cpu(), old[n].cpu()
+        expected = p0.double() + factor * (o.double() - p0.double())
+        scale = float(torch.maximum(p0.abs().max(), o.abs().max()))
+        worst = max(worst, float((got[n].double() - expected).abs().max()) / (eps * scale))
+        # The same 30 shrinks and 6 aggregations replayed directly in float32 give the identical result
+        x = o.clone()
+        for _ in range(6):
+            for _ in range(5):
+                x = p0 + settings.SHRINK_FACTOR * (x - p0)
+            x = s3.aggregate([{"x": x}] * len(w_list), w_list)["x"]
+        require(torch.equal(x, got[n]), f"{n}: loop result differs from a direct float32 replay")
+    require(worst <= ops, f"encoder - phi0 differs from 0.9^30 (old - phi0) by {worst:.1f} roundings (bound {ops})")
+    require(all(v == [5] * 6 for v in summary["shrinks"].values()), f"shrink counts {summary['shrinks']}")
+    require(abs(summary["leftover_rho"] - factor) < 1e-12, f"rho {summary['leftover_rho']} != 0.9^30")
+    require(rounds_saved == sorted([f"round_{r}" for r in range(1, 7)] + ["round_closing"]), f"rounds saved {rounds_saved}")
+    return (f"6 rounds x 5 shrinks at {len(summary['clients'])} clients, aggregated each round: "
+            f"encoder - phi0 = 0.9^30 (old - phi0) within {worst:.1f} float32 roundings of the weights (bound {ops}); "
+            f"bit-identical to a direct float32 replay; rho = {summary['leftover_rho']:.6f}")
+
+
+@check(6, "Step 3: round loop with the real settings (fixture schedule)")
+def check_step3_real_run(args):
+    from unlearning import step3_shrink_repair as s3
+    step3_inputs(args)
+    w = args.withdraw
+    out = settings.step_dir(w, 3)
+    jsonl = os.path.join(settings.logs_dir(w), "repairs.jsonl")
+    n_before = count_lines(jsonl)
+    helpers._ACCESS_LOG.clear()
+    summary = s3.run_step3(w, overwrite=True)
+    STATE["step3_summary"] = summary
+    clients = helpers.remaining_clients(w)
+    require(all(k != w for _, k, _ in helpers.access_log()), f"client {w} was accessed")
+    for name in ("encoder_unlearned.pth", "step3_summary.json"):
+        require(os.path.exists(os.path.join(out, name)), f"{name} missing")
+    rounds = sorted(d for d in os.listdir(out) if d.startswith("round_"))
+    for r in rounds:
+        files = set(os.listdir(os.path.join(out, r)))
+        require(files == {"global_encoder.pth", "state.json"} | {f"optimizer_client_{k}.pt" for k in clients},
+                f"{r}: files {sorted(files)}")
+    n = summary["shrinks"]
+    rho = 1.0
+    for r in range(summary["shrink_rounds_done"]):
+        rho *= sum(summary["weights"][k] * settings.SHRINK_FACTOR ** n[k][r] for k in clients)
+    require(abs(rho - summary["leftover_rho"]) < 1e-12, "rho inconsistent with the shrink counts")
+    total = sum(sum(v) for v in n.values())
+    require(set(summary["final_flip_rates"]) == set(clients), "final flip rates missing")
+    repairs = count_lines(jsonl) - n_before
+    require(repairs > 0, "no repair records written")
+    stall_rounds = [r + 1 for r in range(summary["shrink_rounds_done"]) if any(summary["stalled"][k][r] for k in clients)]
+    return (f"rounds saved {rounds}; shrinks per client {n}; stalls in round(s) {stall_rounds or 'none'}; "
+            f"{repairs} repair records; rho = {summary['leftover_rho']:.4f} (= 0.9^shrinks done, weighted); final flip rates "
+            + ", ".join("client %d %.1f%%/%.1f%%" % (k, 100 * v["top"], 100 * v["bottom"]) for k, v in summary["final_flip_rates"].items()))
+
+
+@check(6, "Step 3: loop bookkeeping when every repair succeeds (path test, threshold raised in-process)")
+def check_step3_success_path(args):
+    import tempfile as tf
+    from unlearning import step3_shrink_repair as s3
+    step3_inputs(args)
+    with settings_override(FLIP_THRESHOLD=1.0), tf.TemporaryDirectory() as tmp:
+        summary = s3.run_step3(args.withdraw, out_dir=tmp)
+        rounds = sorted(d for d in os.listdir(tmp) if d.startswith("round_"))
+        enc = helpers.load_file(os.path.join(tmp, "encoder_unlearned.pth"))
+        STATE["success_path"] = (summary, enc)
+    R, S = settings.SHRINK_ROUNDS, settings.SHRINKS_PER_ROUND
+    require(all(v == [S] * R for v in summary["shrinks"].values()), f"shrink counts {summary['shrinks']}")
+    require(not summary["stopped_early"], "stopped early")
+    require(abs(summary["leftover_rho"] - settings.SHRINK_FACTOR ** (R * S)) < 1e-12, f"rho {summary['leftover_rho']}")
+    require(rounds == sorted([f"round_{r}" for r in range(1, R + 1)] + ["round_closing"]), f"rounds {rounds}")
+    return f"{R} rounds x {S} shrinks, no stall, rounds saved {rounds}, rho = 0.9^{R * S} = {summary['leftover_rho']:.4f}"
+
+
+@check(6, "Step 3: --resume reproduces an uninterrupted run")
+def check_step3_resume(args):
+    import tempfile as tf
+    from unlearning import step3_shrink_repair as s3
+    step3_inputs(args)
+    lines = []
+    # (a) success path: stop after round 1, resume
+    require("success_path" in STATE, "needs the success-path check")
+    full_summary, full_enc = STATE["success_path"]
+    with settings_override(FLIP_THRESHOLD=1.0), tf.TemporaryDirectory() as tmp:
+        require(s3.run_step3(args.withdraw, out_dir=tmp, stop_after_round=1) is None, "did not stop after round 1")
+        require(not os.path.exists(os.path.join(tmp, "encoder_unlearned.pth")), "finished although stopped")
+        try:
+            s3.run_step3(args.withdraw, out_dir=tmp)
+            raise CheckFailed("an earlier run was overwritten without --resume")
+        except FileExistsError:
+            pass
+        resumed = s3.run_step3(args.withdraw, out_dir=tmp, resume=True)
+        enc = helpers.load_file(os.path.join(tmp, "encoder_unlearned.pth"))
+    require(same_tensors(enc, full_enc), "resumed encoder differs from the uninterrupted run")
+    require(resumed["shrinks"] == full_summary["shrinks"] and resumed["leftover_rho"] == full_summary["leftover_rho"],
+            "resumed bookkeeping differs")
+    lines.append("success path: stopped after round 1, resumed -> encoder bit-identical, same shrink counts and rho")
+    # (b) real settings: stop after round 1, resume; compare with the real run
+    require("step3_summary" in STATE, "needs the real-run check")
+    real_enc = helpers.load_file(os.path.join(settings.step_dir(args.withdraw, 3), "encoder_unlearned.pth"))
+    with tf.TemporaryDirectory() as tmp:
+        s3.run_step3(args.withdraw, out_dir=tmp, stop_after_round=1)
+        resumed = s3.run_step3(args.withdraw, out_dir=tmp, resume=True)
+        enc = helpers.load_file(os.path.join(tmp, "encoder_unlearned.pth"))
+    require(same_tensors(enc, real_enc), "resumed encoder differs from the real run")
+    require(resumed["final_flip_rates"] == STATE["step3_summary"]["final_flip_rates"], "final flip rates differ")
+    lines.append("real settings: stopped after round 1, resumed -> bit-identical to the uninterrupted run")
+    lines.append("a rerun without --resume is refused")
+    return "; ".join(lines)
+
+
+# -----------------
+# Phase 7 (Step 4)
+# -----------------
+def step4_client_maps(args, k):
+    """One batch of client k: old code maps (reference encoder, deployed codebook) per level, and the deployed model."""
+    from unlearning import step4_decoder_fit as s4
+    require_results_dir()
+    helpers.set_withdrawn(args.withdraw)
+    ref = helpers.load_reference_model()
+    model = helpers.load_deployed_model(k)
+    batch = next(iter(helpers.make_loader(k, "train", shuffle=False, drop_last=False)))
+    with torch.no_grad():
+        z = dict(zip(("top", "bottom"), ref.encode(batch["lr"].to(settings.DEVICE))))
+        maps = {lvl: s4.code_map(z[lvl], helpers.quantizer(model, lvl)._embedding.weight.detach())
+                for lvl in helpers.LEVELS}
+    return model, maps
+
+
+@check(7, "Step 4: W times an unfolded patch equals the conv layer's output")
+def check_step4_patch_order(args):
+    from unlearning import step4_decoder_fit as s4
+    k = helpers.remaining_clients(args.withdraw)[0]
+    model, maps = step4_client_maps(args, k)
+    g = torch.Generator().manual_seed(9)
+    lines = []
+    with torch.no_grad():
+        for lvl in helpers.LEVELS:
+            conv = helpers.decoder_entry_conv(model, lvl)
+            W = s4.layer_matrix(conv)
+            for label, x in (("code map", maps[lvl][:2]),
+                             ("random map", torch.randn(2, conv.in_channels, 11, 13, generator=g).to(W.device))):
+                out = conv(x)
+                worst = 0.0
+                for i in range(x.shape[0]):
+                    via_w = (W @ s4.patches(x[i:i + 1], conv).t()).view(out.shape[1:])
+                    worst = max(worst, float((via_w - out[i]).abs().max() / out[i].abs().max()))
+                require(worst < 1e-5, f"{lvl} {label}: W x patch differs from the conv output (relative {worst:.1e})")
+            lines.append(f"{lvl}: W is {W.shape[0]}x{W.shape[1]}, matches the conv on code maps and random maps")
+    return "; ".join(lines)
+
+
+@check(7, "Step 4: fit with new input equal to old input gives W' = W")
+def check_step4_identity_fit(args):
+    from unlearning import step4_decoder_fit as s4
+    k = helpers.remaining_clients(args.withdraw)[0]
+    model, maps = step4_client_maps(args, k)
+    lines = []
+    for lvl in helpers.LEVELS:
+        conv = helpers.decoder_entry_conv(model, lvl)
+        W = s4.layer_matrix(conv)
+        m = s4.PatchMoments(W.shape[1], W.device)
+        m.add(maps[lvl], maps[lvl], conv, torch.Generator().manual_seed(0))
+        W_new, lam = m.solve(W)
+        rel = float((W_new - W.double()).norm() / W.double().norm())
+        require(rel < 1e-9, f"{lvl}: W' differs from W by {rel:.1e}")
+        require(m.residual(W_new, W) < 1e-9, f"{lvl}: residual {m.residual(W_new, W)}")
+        lines.append(f"{lvl}: |W'-W|/|W| = {rel:.1e} over {m.count:,} patches (lambda {lam:.2e})")
+    return "; ".join(lines)
+
+
+@check(7, "Step 4: fit recovers an exact linear change of the code vectors")
+def check_step4_linear_change(args):
+    from unlearning import step4_decoder_fit as s4
+    k = helpers.remaining_clients(args.withdraw)[0]
+    model, maps = step4_client_maps(args, k)
+    g = torch.Generator().manual_seed(1)
+    lines = []
+    for lvl in helpers.LEVELS:
+        conv = helpers.decoder_entry_conv(model, lvl)
+        W = s4.layer_matrix(conv)
+        D = conv.in_channels
+        M = (torch.eye(D) + 0.5 * torch.randn(D, D, generator=g) / D ** 0.5).to(W.device)  # invertible mix of channels
+        new = torch.einsum("ij,bjhw->bihw", M, maps[lvl]) + 0.3                         # plus a shift
+        m = s4.PatchMoments(W.shape[1], W.device)
+        m.add(maps[lvl], new, conv, torch.Generator().manual_seed(0))
+        W_new, _ = m.solve(W)
+        before, after = m.residual(W, W), m.residual(W_new, W)
+        require(after < 1e-3 * max(before, 1e-12) or after < 1e-6,
+                f"{lvl}: feature error {before:.3e} -> {after:.3e}; the solve does not recover the change")
+        lines.append(f"{lvl}: feature error {before:.3f} -> {after:.1e}")
+    return "; ".join(lines) + " (channel mix + shift undone by the refit layer)"
+
+
+@check(7, "Step 4: decoder fit on the fixture writes the expected models")
+def check_step4_run(args):
+    from unlearning import step4_decoder_fit as s4
+    from unlearning.step2_server_quantities import quantities_path
+    require_results_dir()
+    w = args.withdraw
+    if not os.path.exists(s4.unlearned_encoder_path(w)):
+        raise CheckFailed("Step 3 output missing (run the Phase 6 checks first)")
+    helpers._ACCESS_LOG.clear()
+    summary = s4.run_step4(w, overwrite=True)
+    clients = helpers.remaining_clients(w)
+    require(all(k != w for _, k, _ in helpers.access_log()), f"client {w} was accessed")
+    files = sorted(f for f in os.listdir(settings.step_dir(w, 4)) if f.endswith(".pth"))
+    require(files == sorted(f"fit_client_{k}.pth" for k in clients), f"files {files}")
+    enc = helpers.load_file(s4.unlearned_encoder_path(w))
+    q = helpers.load_file(quantities_path(w))
+    lines = []
+    for k in clients:
+        sd = helpers.load_file(s4.fit_path(w, k))
+        m = models.VQVAE2()
+        m.load_state_dict(sd)  # strict: the file holds the complete model
+        deployed = helpers.load_file(helpers.deployed_model_path(k))
+        for name, v in enc.items():
+            require(torch.equal(sd[name], v), f"client {k}: {name} is not the unlearned encoder")
+        for lvl, (cb_key, mask_key) in zip(("top", "bot"), zip(helpers.CODEBOOK_KEYS, helpers.MASK_KEYS)):
+            require(torch.equal(sd[cb_key], q[f"V_{lvl}"]), f"client {k}: {cb_key} is not the clean codebook")
+            require(torch.equal(sd[mask_key], q[f"mask_{lvl}"]), f"client {k}: {mask_key} is not the mask")
+        entry = {f"decoder.{c}.{p}" for c in ("pre_conv_top", "pre_conv_bottom") for p in ("weight", "bias")}
+        for name, v in sd.items():
+            if name.startswith(helpers.DECODER_PREFIX):
+                same = torch.equal(v, deployed[name])
+                require(same != (name in entry), f"client {k}: {name} {'unchanged' if same else 'changed'}")
+        require(all(float(sd[f"{qn}.code_usage"].abs().sum()) == 0 for qn in ("quantizer_top", "quantizer_bottom")),
+                f"client {k}: usage counters not cleared")
+        rep = summary["per_client"][k]
+        lines.append(f"client {k}: feature error top {rep['top']['residual_before']:.3f}->{rep['top']['residual_after']:.3f}, "
+                     f"bottom {rep['bottom']['residual_before']:.3f}->{rep['bottom']['residual_after']:.3f}")
+    return (f"fit_client_k.pth for {clients} only; each = unlearned encoder + clean codebooks + masks + deployed decoder "
+            f"with only the two entry layers changed; " + "; ".join(lines))
 
 
 SETUP = {1: setup_phase1}
