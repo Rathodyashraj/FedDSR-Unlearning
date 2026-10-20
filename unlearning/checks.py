@@ -505,7 +505,8 @@ def check_step0_case1(args):
     import json
     from unlearning import step0_initial_weights as s0
     require_results_dir()
-    require(os.path.exists(s0.round0_path()), "round-0 file missing; Case 1 cannot be tested")
+    if not os.path.exists(s0.round0_path()):
+        raise CheckSkipped("no round-0 file (model trained with the old server.py): Case 1 does not apply")
     phi0, info = s0.run_step0(overwrite=True)
     require(info["case"] == 1, f"Case {info['case']} taken, expected Case 1")
     on_disk = helpers.load_file(s0.phi0_path())
@@ -525,6 +526,8 @@ def check_step0_case1(args):
 def check_step0_regenerate(args):
     from unlearning import step0_initial_weights as s0
     require_results_dir()
+    if not os.path.exists(s0.round0_path()):
+        raise CheckSkipped("no round-0 file to compare against: the r x sqrt(N) check below is the test for Case 2")
     saved = helpers.load_file(s0.round0_path())
     before = snapshot_tree(settings.training_dir(), settings.stage2_dir())
     lines = []
@@ -1282,6 +1285,325 @@ def check_step4_run(args):
             f"with only the two entry layers changed; " + "; ".join(lines))
 
 
+# -----------------
+# Phase 8 (Step 5)
+# -----------------
+@check(8, "Step 5: encoder, codebooks and masks unchanged by fine-tuning")
+def check_step5_run(args):
+    from unlearning import step5_finetune as s5
+    from unlearning.step4_decoder_fit import fit_path
+    require_results_dir()
+    w = args.withdraw
+    clients = helpers.remaining_clients(w)
+    if not all(os.path.exists(fit_path(w, k)) for k in clients):
+        raise CheckFailed("Step 4 output missing (run the Phase 7 checks first)")
+    helpers._ACCESS_LOG.clear()
+    s5.run_step5(w, overwrite=True)
+    require(all(k != w for _, k, _ in helpers.access_log()), f"client {w} was accessed")
+    files = sorted(f for f in os.listdir(settings.step_dir(w, 5)) if f.endswith(".pth"))
+    require(files == sorted(f"finetuned_client_{k}.pth" for k in clients), f"files {files}")
+    lines = []
+    for k in clients:
+        before, after = helpers.load_file(fit_path(w, k)), helpers.load_file(s5.finetuned_path(w, k))
+        m = models.VQVAE2()
+        m.load_state_dict(after)  # strict
+        frozen = [n for n in before if helpers.is_encoder_key(n)] + list(helpers.CODEBOOK_KEYS) + list(helpers.MASK_KEYS)
+        changed = [n for n in frozen if not torch.equal(before[n], after[n])]
+        require(not changed, f"client {k}: {changed[:3]} changed")
+        dec = [n for n in before if n.startswith(helpers.DECODER_PREFIX)]
+        moved = [n for n in dec if not torch.equal(before[n], after[n])]
+        require(moved, f"client {k}: the decoder did not change")
+        lines.append(f"client {k}: {len(frozen)} frozen tensors bit-identical, {len(moved)}/{len(dec)} decoder tensors trained")
+    return "; ".join(lines)
+
+
+@check(8, "Step 5: control - with vitalization on, the same fine-tuning changes the codebook")
+def check_step5_vitalize_control(args):
+    from unlearning.step4_decoder_fit import fit_path
+    require_results_dir()
+    w = args.withdraw
+    k = helpers.remaining_clients(w)[0]
+    helpers.set_withdrawn(w)
+    stage2 = helpers.load_stage2_module()
+    model = models.VQVAE2()
+    model.load_state_dict(helpers.load_file(fit_path(w, k)))
+    model.to(settings.DEVICE)   # vitalize left on: the Stage-2 default
+    before = {key: model.state_dict()[key].clone() for key in helpers.CODEBOOK_KEYS}
+    log = logging.getLogger("control")
+    stage2.freeze_encoder_quantizer(model, log, k)
+    torch.manual_seed(settings.SEED + k)
+    stage2.finetune_decoder(model, helpers.make_loader(k, "train", shuffle=True, drop_last=True), k,
+                            epochs=settings.FINETUNE_EPOCHS, lr=settings.FINETUNE_LR, device=settings.DEVICE,
+                            logger=log, results_dir=None)
+    rows = {key: int((model.state_dict()[key] != before[key]).any(dim=1).sum()) for key in helpers.CODEBOOK_KEYS}
+    require(sum(rows.values()) > 0, "codebook unchanged even with vitalization on: the main check is not informative")
+    return (f"client {k}: with vitalization on, {rows[helpers.CODEBOOK_KEYS[0]]} top and "
+            f"{rows[helpers.CODEBOOK_KEYS[1]]} bottom rows were overwritten although the codebook is frozen; "
+            f"with it off (Step 5) none were")
+
+
+# -----------------
+# Phase 9 (Step 6)
+# -----------------
+@check(9, "Step 6: release writes the unlearned model, nothing for the withdrawn client")
+def check_step6_release(args):
+    from unlearning import step6_release as s6
+    from unlearning.step5_finetune import finetuned_path
+    require_results_dir()
+    w = args.withdraw
+    clients = helpers.remaining_clients(w)
+    if not all(os.path.exists(finetuned_path(w, k)) for k in clients):
+        raise CheckFailed("Step 5 output missing (run the Phase 8 checks first)")
+    helpers._ACCESS_LOG.clear()
+    summary = s6.release(w, overwrite=True)
+    require(all(k != w for _, k, _ in helpers.access_log()), f"client {w} was accessed")
+    out = s6.release_dir(w)
+    files = sorted(os.listdir(out))
+    expected = sorted(["best_model.pth", "phi0.pth", "summary.json"] + [f"unlearned_client_{k}.pth" for k in clients])
+    require(files == expected, f"release holds {files}, expected {expected}")
+    best = helpers.load_file(os.path.join(out, "best_model.pth"))
+    shared_keys = set(models.VQVAE2().get_shared_state_dict())
+    require(set(best) == shared_keys | set(helpers.MASK_KEYS), "best_model.pth keys differ from shared part + masks")
+    for key in ("withdrawn", "remaining_clients", "weights", "margins", "active_rows", "shrinks_done",
+                "leftover_rho", "final_flip_rates"):
+        require(key in summary, f"summary.json lacks {key}")
+    require(summary["remaining_clients"] == clients and summary["withdrawn"] == w, "summary clients wrong")
+    return (f"release/ = {files}; best_model.pth = {len(shared_keys)} shared tensors + 2 masks; "
+            f"summary: rho {summary['leftover_rho']:.4g}, active rows {summary['active_rows']}")
+
+
+@check(9, "Step 6: released files load with the existing loading code; masks present")
+def check_step6_load(args):
+    import tempfile as tf
+    import shutil as sh
+    from unlearning import step6_release as s6
+    from unlearning.step2_server_quantities import quantities_path
+    require_results_dir()
+    w = args.withdraw
+    out = s6.release_dir(w)
+    q = helpers.load_file(quantities_path(w))
+    stage2 = helpers.load_stage2_module()
+    lines = []
+    with tf.TemporaryDirectory() as tmp:
+        # Lay the release out as a training results folder and load it with Stage 2's own loader
+        layout = os.path.join(tmp, config.AGGREGATOR)
+        os.makedirs(layout)
+        sh.copy(os.path.join(out, "best_model.pth"), os.path.join(layout, "best_model.pth"))
+        for k in helpers.remaining_clients(w):
+            sh.copy(s6.released_client_path(w, k), os.path.join(layout, f"best_decoder_client_{k}.pth"))
+        with config_override(RESULTS_DIR=tmp):
+            for k in helpers.remaining_clients(w):
+                model = stage2.load_stage1_model(k, torch.device("cpu"), logging.getLogger("load"))
+                released = helpers.load_file(s6.released_client_path(w, k))
+                sd = model.state_dict()
+                diff = [n for n in released if not torch.equal(sd[n], released[n])]
+                require(not diff, f"client {k}: {len(diff)} tensors not loaded, e.g. {diff[:3]}")
+                for (lvl, sfx), mk in zip((("top", "top"), ("bottom", "bot")), helpers.MASK_KEYS):
+                    require(torch.equal(sd[mk], q[f"mask_{sfx}"]), f"client {k}: {mk} not loaded")
+                model.eval()
+                with torch.no_grad():
+                    lr = torch.zeros(1, config.IMAGE_CHANNELS, config.IMAGE_SIZE // 2, config.IMAGE_SIZE // 2)
+                    out_img, _ = model(lr)
+                require(tuple(out_img.shape[-2:]) == (config.IMAGE_SIZE, config.IMAGE_SIZE), "forward failed")
+                lines.append(f"client {k}: all {len(released)} tensors incl. masks loaded by Stage 2's load_stage1_model")
+    # best_model.pth alone, through the training code's shared loader
+    m = models.VQVAE2()
+    m.load_shared_state_dict(helpers.load_file(os.path.join(out, "best_model.pth")))
+    for mk, sfx in zip(helpers.MASK_KEYS, ("top", "bot")):
+        require(torch.equal(m.state_dict()[mk], q[f"mask_{sfx}"]), f"{mk} not loaded by load_shared_state_dict")
+    lines.append("best_model.pth loads with load_shared_state_dict, masks included")
+    return "; ".join(lines) + "; forward pass works"
+
+
+@check(9, "Step 6: clean-up lists only, and deletes only when asked (on a copy of the results folder)")
+def check_step6_cleanup(args):
+    import tempfile as tf
+    import shutil as sh
+    from unlearning import step6_release as s6
+    require_results_dir()
+    w = args.withdraw
+    original_dir = settings.RESULTS_DIR
+    before = snapshot_tree(original_dir)
+    listed = s6.report_cleanup(w)
+    require(snapshot_tree(original_dir) == before, "listing the clean-up changed files")
+    n_png = sum(1 for p in listed["training"] if p.endswith(".png"))
+    require(listed["unlearning"] and listed["training"], "nothing listed")
+    lines = [f"dry run: {len(listed['unlearning'])} unlearning items and {len(listed['training'])} training items "
+             f"listed (incl. {n_png} sample images), nothing deleted"]
+    with tf.TemporaryDirectory() as tmp:
+        copy_dir = os.path.join(tmp, "results_copy")
+        sh.copytree(original_dir, copy_dir)
+        try:
+            settings.configure(results_dir=copy_dir, fixture=settings.FIXTURE, trial=settings.TRIAL)
+            train_before = snapshot_tree(settings.training_dir(), settings.stage2_dir())
+            items = s6.cleanup_list(w)
+            deleted = s6.purge(w, include_training=False)
+            require(sorted(deleted) == sorted(items["unlearning"]), "--purge deleted something else")
+            require(not any(os.path.exists(p) for p in items["unlearning"]), "unlearning items still present")
+            require(snapshot_tree(settings.training_dir(), settings.stage2_dir()) == train_before,
+                    "--purge alone touched the training folders")
+            release_files = sorted(os.listdir(s6.release_dir(w)))
+            deleted = s6.purge(w, include_training=True)
+            require(not any(os.path.exists(p) for p in items["training"]), "training items still present")
+            kept = os.path.join(settings.training_dir(), "round_0_global_model.pth")
+            require(os.path.exists(kept), "round_0_global_model.pth was deleted")
+            require(sorted(os.listdir(s6.release_dir(w))) == release_files, "the release was touched")
+            m = models.VQVAE2()
+            m.load_shared_state_dict(helpers.load_file(os.path.join(s6.release_dir(w), "best_model.pth")))
+            lines.append(f"on a copy: --purge removed the {len(items['unlearning'])} unlearning items only; "
+                         f"--purge-training-files removed the {len(items['training'])} training items; "
+                         f"round-0 file and release/ kept and loadable")
+        finally:
+            settings.configure(results_dir=original_dir if not settings.FIXTURE else None, fixture=settings.FIXTURE, trial=settings.TRIAL)
+    require(snapshot_tree(original_dir) == before, "the real results folder changed")
+    return "; ".join(lines)
+
+
+# -----------------
+# Phase 10 (run script, smoke test, withdrawn-client audit)
+# -----------------
+_AUDIT = {"on": False, "events": []}
+
+
+def _audit_hook(event, args):
+    """Records every file opened and every folder listed while an audited run is active."""
+    if not _AUDIT["on"] or event not in ("open", "os.listdir", "os.scandir", "glob.glob"):
+        return
+    path = args[0] if args else None
+    if isinstance(path, bytes):
+        path = path.decode(errors="replace")
+    if isinstance(path, str):
+        _AUDIT["events"].append((event, os.path.realpath(path)))
+
+
+def withdrawn_paths(w):
+    """What must never be opened or listed for withdrawn client w."""
+    data_dir = os.path.realpath(config.CLIENT_DATASETS[w]["path"])
+    names = {f"best_decoder_client_{w}.pth", f"best_refined_decoder_client_{w}.pth", f"stats_client_{w}.pt",
+             f"fit_client_{w}.pth", f"finetuned_client_{w}.pth", f"unlearned_client_{w}.pth"}
+    return data_dir, names
+
+
+@check(10, "Smoke test on the fixture, once per withdrawn client, with every file access audited")
+def check_smoke_and_audit(args):
+    from unlearning import run as runner
+    require_results_dir()
+    if not getattr(sys, "_unlearning_audit_installed", False):
+        sys.addaudithook(_audit_hook)  # audit hooks cannot be removed; it only records while _AUDIT["on"]
+        sys._unlearning_audit_installed = True
+    root = logging.getLogger()
+    lines = []
+    for w in helpers.all_clients():
+        log_path = os.path.join(settings.logs_dir(w), "run.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        file_handler = logging.FileHandler(log_path, mode="w")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        old_level = root.level
+        root.addHandler(file_handler)
+        root.setLevel(logging.INFO)
+        helpers._ACCESS_LOG.clear()
+        _AUDIT["events"].clear()
+        _AUDIT["on"] = True
+        try:
+            timings = runner.run_pipeline(w, overwrite=True)
+        finally:
+            _AUDIT["on"] = False
+            root.removeHandler(file_handler)
+            file_handler.close()
+            root.setLevel(old_level)
+        events = list(_AUDIT["events"])
+        # Every output file written, nothing for the withdrawn client
+        for step in range(1, 7):
+            missing = [p for p in runner.step_outputs(step, w) if not os.path.exists(p)]
+            require(not missing, f"withdraw {w}: step {step} output missing: {missing[:1]}")
+        release_files = os.listdir(os.path.join(settings.withdraw_dir(w), "release"))
+        require(not any(f"client_{w}" in f for f in release_files), f"withdraw {w}: a released file for client {w}")
+        # The audit: no data, decoder or statistics of the withdrawn client opened or listed
+        data_dir, names = withdrawn_paths(w)
+        bad = [(e, p) for e, p in events if p == data_dir or p.startswith(data_dir + os.sep)
+               or os.path.basename(p) in names]
+        require(not bad, f"withdraw {w}: withdrawn client's files touched: {bad[:3]}")
+        others = {k: sum(1 for e, p in events if e == "open" and p.startswith(
+            os.path.realpath(config.CLIENT_DATASETS[k]["path"]) + os.sep)) for k in helpers.remaining_clients(w)}
+        require(all(n > 0 for n in others.values()), f"withdraw {w}: audit saw no image reads ({others}); hook not working")
+        # The logs: no access line for the withdrawn client
+        with open(log_path) as f:
+            log_text = f.read()
+        access_lines = [line for line in log_text.splitlines() if "[access]" in line]
+        require(access_lines, f"withdraw {w}: run.log has no access records")
+        require(not [line for line in access_lines if f" client={w} " in line + " "],
+                f"withdraw {w}: run.log records an access to client {w}")
+        lines.append(f"withdraw {w}: steps 1-6 in {sum(timings.values()):.0f} s, all outputs written; "
+                     f"{len(events):,} file events audited, images read from clients "
+                     f"{sorted(others)} ({sum(others.values())} opens), none of client {w}")
+    # Control: the audit does catch a touch of the withdrawn client's files
+    w = helpers.all_clients()[-1]
+    data_dir, _ = withdrawn_paths(w)
+    _AUDIT["events"].clear()
+    _AUDIT["on"] = True
+    try:
+        os.listdir(data_dir)
+    finally:
+        _AUDIT["on"] = False
+    require(any(p == data_dir for _, p in _AUDIT["events"]), "control: the audit missed a listing of the data folder")
+    lines.append(f"control: listing client {w}'s data folder is caught by the audit")
+    return "; ".join(lines)
+
+
+@check(10, "run.py: refuses a finished run, --steps, --resume, missing prerequisites")
+def check_run_flags(args):
+    import tempfile as tf
+    import shutil as sh
+    from unlearning import run as runner
+    from unlearning.step0_initial_weights import phi0_path
+    from unlearning.step4_decoder_fit import fit_path
+    require_results_dir()
+    w = args.withdraw
+    lines = []
+    # A finished run is refused without --overwrite or --resume
+    try:
+        runner.run_pipeline(w)
+        raise CheckFailed("a finished run was redone without --overwrite")
+    except FileExistsError:
+        lines.append("finished run refused without --overwrite")
+    # --steps 6 --overwrite runs only Step 6
+    earlier = snapshot_tree(*[settings.step_dir(w, s) for s in range(1, 6)])
+    timings = runner.run_pipeline(w, steps=[6], overwrite=True)
+    require(list(timings) == [6], f"ran steps {list(timings)}")
+    require(snapshot_tree(*[settings.step_dir(w, s) for s in range(1, 6)]) == earlier, "--steps 6 touched earlier steps")
+    lines.append("--steps 6 ran only Step 6")
+    # --resume reuses finished steps; Step 3 resumes and gives the same encoder
+    enc_before = helpers.load_file(runner.step_outputs(3, w)[0])
+    timings = runner.run_pipeline(w, resume=True)
+    require(list(timings) == [3], f"--resume ran steps {list(timings)}")
+    require(same_tensors(enc_before, helpers.load_file(runner.step_outputs(3, w)[0])), "--resume changed the encoder")
+    lines.append("--resume reused steps 1,2,4,5,6 and resumed Step 3 to the same encoder")
+    # Missing prerequisites stop the run before the step starts (on a copy of the results folder)
+    original_dir = settings.RESULTS_DIR
+    with tf.TemporaryDirectory() as tmp:
+        copy_dir = os.path.join(tmp, "results_copy")
+        sh.copytree(original_dir, copy_dir)
+        try:
+            settings.configure(results_dir=copy_dir, fixture=settings.FIXTURE, trial=settings.TRIAL)
+            k = helpers.remaining_clients(w)[0]
+            os.remove(fit_path(w, k))
+            try:
+                runner.run_pipeline(w, steps=[5], overwrite=True)
+                raise CheckFailed("Step 5 started without the Step 4 output")
+            except FileNotFoundError as e:
+                require(f"fit_client_{k}.pth" in str(e), f"wrong message: {e}")
+            os.remove(phi0_path())
+            try:
+                runner.run_pipeline(w, steps=[3], overwrite=True)
+                raise CheckFailed("Step 3 started without phi0.pth")
+            except FileNotFoundError as e:
+                require("run Step 0 first" in str(e), f"wrong message: {e}")
+        finally:
+            settings.configure(results_dir=original_dir if not settings.FIXTURE else None, fixture=settings.FIXTURE, trial=settings.TRIAL)
+    lines.append("missing Step 4 output or phi0.pth stops the run with a clear message")
+    return "; ".join(lines)
+
+
 SETUP = {1: setup_phase1}
 
 
@@ -1294,13 +1616,15 @@ def main():
     parser.add_argument("--phase", type=int, action="append",
                         help="Phase(s) to check; default: every phase implemented so far")
     parser.add_argument("--withdraw", type=int, default=3, help="Withdrawn client for the per-withdrawal checks")
+    parser.add_argument("--trial", action="store_true",
+                        help="Real model: 64 slices per client and the short schedule, so the checks finish quickly")
     parser.add_argument("--original-models", default=None,
                         help="Path to an unmodified models.py; enables the Phase 1 equivalence check")
     args = parser.parse_args()
     if args.original_models and not os.path.exists(args.original_models):
         parser.error(f"--original-models: {args.original_models} not found")
     if args.fixture or args.results_dir:
-        settings.configure(results_dir=args.results_dir, fixture=args.fixture)
+        settings.configure(results_dir=args.results_dir, fixture=args.fixture, trial=args.trial)
 
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     for h in logging.getLogger().handlers:

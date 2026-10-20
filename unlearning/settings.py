@@ -131,7 +131,9 @@ def client_name(k):
 
 
 def withdraw_dir(withdrawn):
-    return os.path.join(unlearning_root(), f"withdraw_{withdrawn}_{client_name(withdrawn)}")
+    """One folder per withdrawal; a trial run gets its own folder so it never blocks the full run."""
+    suffix = "_trial" if TRIAL else ""
+    return os.path.join(unlearning_root(), f"withdraw_{withdrawn}_{client_name(withdrawn)}{suffix}")
 
 
 def step_dir(withdrawn, step):
