@@ -3,3 +3,4 @@ BTP-papers/
 FedDSR_results_fixture/
 __pycache__/
 .claude/
+.venv
